@@ -10,6 +10,7 @@ var mp2t = require('../lib/m2ts'),
     testSegment = require('./utils/test-segment'),
     mp4AudioProperties = require('../lib/mp4/transmuxer').AUDIO_PROPERTIES,
     mp4VideoProperties = require('../lib/mp4/transmuxer').VIDEO_PROPERTIES,
+    clock = require('../lib/utils/clock'),
     TransportPacketStream = mp2t.TransportPacketStream,
     transportPacketStream,
     TransportParseStream = mp2t.TransportParseStream,
@@ -423,13 +424,21 @@ QUnit.test('parse the elementary streams from a program map table', function() {
   QUnit.deepEqual(transportParseStream.programMapTable, packet.programMapTable, 'recorded the PMT');
 });
 
-pesHeader = function(first, pts) {
+pesHeader = function(first, pts, dataLength) {
+  if (!dataLength) {
+    dataLength = 0;
+  } else {
+    // Add the pes header length (only the portion after the
+    // pes_packet_length field)
+    dataLength += 3;
+  }
+
   // PES_packet(), Rec. ITU-T H.222.0, Table 2-21
   var result = [
     // pscp:0000 0000 0000 0000 0000 0001
     0x00, 0x00, 0x01,
-    // sid:0000 0000 ppl:0000 0000 0000 0101
-    0x00, 0x00, 0x05,
+    // sid:0000 0000 ppl:0000 0000 0000 0000
+    0x00, 0x00, 0x00,
     // 10 psc:00 pp:0 dai:1 c:0 ooc:0
     0x84,
     // pdf:?0 ef:1 erf:0 dtmf:0 acif:0 pcf:0 pef:0
@@ -452,11 +461,18 @@ pesHeader = function(first, pts) {
     result.push(((pts >>> 14) | 0x01) & 0xff);
     result.push((pts >>> 7) & 0xff);
     result.push(((pts << 1) | 0x01) & 0xff);
-  }
 
+    // Add the bytes spent on the pts info
+    dataLength += 5;
+  }
   if (first) {
     result.push(0x00);
+    dataLength += 1;
   }
+
+  // Finally set the pes_packet_length field
+  result[4] = (dataLength & 0x0000FF00) >> 8;
+  result[5] = dataLength & 0x000000FF;
 
   return result;
 };
@@ -468,7 +484,7 @@ pesHeader = function(first, pts) {
  * @payload first {boolean} - true if this PES should be a payload
  * unit start
  */
-transportPacket = function(pid, data, first, pts) {
+transportPacket = function(pid, data, first, pts, isVideoData) {
   var
     adaptationFieldLength = 188 - data.length - 14 - (first ? 1 : 0) - (pts ? 5 : 0),
     // transport_packet(), Rec. ITU-T H.222.0, Table 2-2
@@ -494,7 +510,7 @@ transportPacket = function(pid, data, first, pts) {
   }
 
   // PES_packet(), Rec. ITU-T H.222.0, Table 2-21
-  result = result.concat(pesHeader(first, pts));
+  result = result.concat(pesHeader(first, pts, isVideoData ? 0 : data.length));
 
   return result.concat(data);
 };
@@ -509,7 +525,7 @@ videoPes = function(data, first, pts) {
   return transportPacket(0x11, [
     // NAL unit start code
     0x00, 0x00, 0x01
-  ].concat(data), first, pts);
+  ].concat(data), first, pts, true);
 };
 
 /**
@@ -605,7 +621,7 @@ QUnit.test('parses standalone program stream packets', function() {
   var
     packets = [],
     packetData = [0x01, 0x02],
-    pesHead = pesHeader(false, 7);
+    pesHead = pesHeader(false, 7, 2);
 
   elementaryStream.on('data', function(packet) {
     packets.push(packet);
@@ -754,8 +770,10 @@ QUnit.test('parses an elementary stream packet without a pts or dts', function()
   QUnit.ok(!packet.dts, 'did not parse a dts');
 });
 
-QUnit.test('buffers audio and video program streams individually', function() {
+QUnit.test('won\'t emit non-video packets if the PES_packet_length doesn\'t match contents', function() {
   var events = [];
+  var pesHead = pesHeader(false, 1, 5);
+
   elementaryStream.on('data', function(event) {
     events.push(event);
   });
@@ -764,13 +782,40 @@ QUnit.test('buffers audio and video program streams individually', function() {
     type: 'pes',
     payloadUnitStartIndicator: true,
     streamType: H264_STREAM_TYPE,
-    data: new Uint8Array(1)
+    data: new Uint8Array(pesHead.concat([1]))
   });
   elementaryStream.push({
     type: 'pes',
     payloadUnitStartIndicator: true,
     streamType: ADTS_STREAM_TYPE,
-    data: new Uint8Array(1)
+    data: new Uint8Array(pesHead.concat([1]))
+  });
+  QUnit.equal(0, events.length, 'buffers partial packets');
+
+  elementaryStream.flush();
+  QUnit.equal(events.length, 1, 'emitted a single packet');
+  QUnit.equal('video', events[0].type, 'identified video data');
+});
+
+QUnit.test('buffers audio and video program streams individually', function() {
+  var events = [];
+  var pesHead = pesHeader(false, 1, 2);
+
+  elementaryStream.on('data', function(event) {
+    events.push(event);
+  });
+
+  elementaryStream.push({
+    type: 'pes',
+    payloadUnitStartIndicator: true,
+    streamType: H264_STREAM_TYPE,
+    data: new Uint8Array(pesHead.concat([1]))
+  });
+  elementaryStream.push({
+    type: 'pes',
+    payloadUnitStartIndicator: true,
+    streamType: ADTS_STREAM_TYPE,
+    data: new Uint8Array(pesHead.concat([1]))
   });
   QUnit.equal(0, events.length, 'buffers partial packets');
 
@@ -792,6 +837,8 @@ QUnit.test('buffers audio and video program streams individually', function() {
 
 QUnit.test('flushes the buffered packets when a new one of that type is started', function() {
   var packets = [];
+  var pesHead = pesHeader(false, 1, 2);
+
   elementaryStream.on('data', function(packet) {
     packets.push(packet);
   });
@@ -799,41 +846,43 @@ QUnit.test('flushes the buffered packets when a new one of that type is started'
     type: 'pes',
     payloadUnitStartIndicator: true,
     streamType: H264_STREAM_TYPE,
-    data: new Uint8Array(1)
+    data: new Uint8Array(pesHead.concat([1]))
   });
   elementaryStream.push({
     type: 'pes',
     payloadUnitStartIndicator: true,
     streamType: ADTS_STREAM_TYPE,
-    data: new Uint8Array(7)
+    data: new Uint8Array(pesHead.concat([1, 2]))
   });
   elementaryStream.push({
     type: 'pes',
     streamType: H264_STREAM_TYPE,
     data: new Uint8Array(1)
   });
-  QUnit.equal(0, packets.length, 'buffers packets by type');
+  QUnit.equal(packets.length, 0, 'buffers packets by type');
 
   elementaryStream.push({
     type: 'pes',
     payloadUnitStartIndicator: true,
     streamType: H264_STREAM_TYPE,
-    data: new Uint8Array(1)
+    data: new Uint8Array(pesHead.concat([1]))
   });
-  QUnit.equal(1, packets.length, 'built one packet');
-  QUnit.equal('video', packets[0].type, 'identified video data');
-  QUnit.equal(2, packets[0].data.byteLength, 'concatenated packets');
+  QUnit.equal(packets.length, 1, 'built one packet');
+  QUnit.equal(packets[0].type, 'video', 'identified video data');
+  QUnit.equal(packets[0].data.byteLength, 2, 'concatenated packets');
 
   elementaryStream.flush();
-  QUnit.equal(3, packets.length, 'built two more packets');
-  QUnit.equal('video', packets[1].type, 'identified video data');
-  QUnit.equal(1, packets[1].data.byteLength, 'parsed the video payload');
-  QUnit.equal('audio', packets[2].type, 'identified audio data');
-  QUnit.equal(7, packets[2].data.byteLength, 'parsed the audio payload');
+  QUnit.equal(packets.length, 3, 'built two more packets');
+  QUnit.equal(packets[1].type, 'video', 'identified video data');
+  QUnit.equal(packets[1].data.byteLength, 1, 'parsed the video payload');
+  QUnit.equal(packets[2].type, 'audio', 'identified audio data');
+  QUnit.equal(packets[2].data.byteLength, 2, 'parsed the audio payload');
 });
 
 QUnit.test('buffers and emits timed-metadata', function() {
   var packets = [];
+  var pesHead = pesHeader(false, 1, 4);
+
   elementaryStream.on('data', function(packet) {
     packets.push(packet);
   });
@@ -842,7 +891,7 @@ QUnit.test('buffers and emits timed-metadata', function() {
     type: 'pes',
     payloadUnitStartIndicator: true,
     streamType: METADATA_STREAM_TYPE,
-    data: new Uint8Array([0, 1])
+    data: new Uint8Array(pesHead.concat([0, 1]))
   });
   elementaryStream.push({
     type: 'pes',
@@ -855,7 +904,12 @@ QUnit.test('buffers and emits timed-metadata', function() {
     type: 'pes',
     payloadUnitStartIndicator: true,
     streamType: METADATA_STREAM_TYPE,
-    data: new Uint8Array([4, 5])
+    data: new Uint8Array(pesHead.concat([4, 5]))
+  });
+  elementaryStream.push({
+    type: 'pes',
+    streamType: METADATA_STREAM_TYPE,
+    data: new Uint8Array([6, 7])
   });
   QUnit.equal(packets.length, 1, 'built a packet');
   QUnit.equal(packets[0].type, 'timed-metadata', 'identified timed-metadata');
@@ -864,7 +918,7 @@ QUnit.test('buffers and emits timed-metadata', function() {
   elementaryStream.flush();
   QUnit.equal(packets.length, 2, 'flushed a packet');
   QUnit.equal(packets[1].type, 'timed-metadata', 'identified timed-metadata');
-  QUnit.deepEqual(packets[1].data, new Uint8Array([4, 5]), 'included the data');
+  QUnit.deepEqual(packets[1].data, new Uint8Array([4, 5, 6, 7]), 'included the data');
 });
 
 QUnit.test('drops packets with unknown stream types', function() {
@@ -899,10 +953,10 @@ QUnit.test('Correctly parses rollover PTS', function() {
     maxTS = 8589934592,
     packets = [],
     packetData = [0x01, 0x02],
-    pesHeadOne = pesHeader(false, maxTS - 400),
-    pesHeadTwo = pesHeader(false, maxTS - 100),
-    pesHeadThree = pesHeader(false, maxTS),
-    pesHeadFour = pesHeader(false, 50);
+    pesHeadOne = pesHeader(false, maxTS - 400, 2),
+    pesHeadTwo = pesHeader(false, maxTS - 100, 2),
+    pesHeadThree = pesHeader(false, maxTS, 2),
+    pesHeadFour = pesHeader(false, 50, 2);
 
   timestampRolloverStream.on('data', function(packet) {
     packets.push(packet);
@@ -947,16 +1001,16 @@ QUnit.test('Correctly parses multiple PTS rollovers', function() {
     maxTS = 8589934592,
     packets = [],
     packetData = [0x01, 0x02],
-    pesArray = [pesHeader(false, 1),
-                pesHeader(false, Math.floor(maxTS * (1 / 3))),
-                pesHeader(false, Math.floor(maxTS * (2 / 3))),
-                pesHeader(false, 1),
-                pesHeader(false, Math.floor(maxTS * (1 / 3))),
-                pesHeader(false, Math.floor(maxTS * (2 / 3))),
-                pesHeader(false, 1),
-                pesHeader(false, Math.floor(maxTS * (1 / 3))),
-                pesHeader(false, Math.floor(maxTS * (2 / 3))),
-                pesHeader(false, 1)];
+    pesArray = [pesHeader(false, 1, 2),
+                pesHeader(false, Math.floor(maxTS * (1 / 3)), 2),
+                pesHeader(false, Math.floor(maxTS * (2 / 3)), 2),
+                pesHeader(false, 1, 2),
+                pesHeader(false, Math.floor(maxTS * (1 / 3)), 2),
+                pesHeader(false, Math.floor(maxTS * (2 / 3)), 2),
+                pesHeader(false, 1, 2),
+                pesHeader(false, Math.floor(maxTS * (1 / 3)), 2),
+                pesHeader(false, Math.floor(maxTS * (2 / 3)), 2),
+                pesHeader(false, 1, 2)];
 
   timestampRolloverStream.on('data', function(packet) {
     packets.push(packet);
@@ -2296,6 +2350,304 @@ QUnit.module('AudioSegmentStream', {
   }
 });
 
+QUnit.test('fills audio gaps taking into account audio sample rate', function() {
+  var
+    events = [],
+    boxes,
+    numSilentFrames,
+    videoGap = 0.29,
+    audioGap = 0.49,
+    expectedFillSeconds = audioGap - videoGap,
+    sampleRate = 44100,
+    frameDuration = Math.ceil(90e3 / (sampleRate / 1024)),
+    frameSeconds = clock.videoTsToSeconds(frameDuration),
+    audioBMDT,
+    offsetSeconds = clock.videoTsToSeconds(111),
+    startingAudioBMDT = clock.secondsToAudioTs(10 + audioGap - offsetSeconds, sampleRate);
+
+  audioSegmentStream.on('data', function(event) {
+    events.push(event);
+  });
+
+  audioSegmentStream.setAudioAppendStart(clock.secondsToVideoTs(10));
+  audioSegmentStream.setVideoBaseMediaDecodeTime(clock.secondsToVideoTs(10 + videoGap));
+
+  audioSegmentStream.push({
+    channelcount: 2,
+    samplerate: sampleRate,
+    pts: clock.secondsToVideoTs(10 + audioGap),
+    dts: clock.secondsToVideoTs(10 + audioGap),
+    data: new Uint8Array([1])
+  });
+
+  audioSegmentStream.flush();
+
+  numSilentFrames = Math.floor(expectedFillSeconds / frameSeconds);
+
+  QUnit.equal(events.length, 1, 'a data event fired');
+  QUnit.equal(events[0].track.samples.length, 1 + numSilentFrames, 'generated samples');
+  QUnit.equal(events[0].track.samples[0].size, 364, 'silent sample');
+  QUnit.equal(events[0].track.samples[7].size, 364, 'silent sample');
+  QUnit.equal(events[0].track.samples[8].size, 1, 'normal sample');
+  boxes = mp4.tools.inspect(events[0].boxes);
+
+  audioBMDT = boxes[0].boxes[1].boxes[1].baseMediaDecodeTime;
+
+  QUnit.equal(
+    audioBMDT,
+    // should always be rounded up so as not to overfill
+    Math.ceil(startingAudioBMDT -
+              clock.secondsToAudioTs(numSilentFrames * frameSeconds, sampleRate)),
+    'filled the gap to the nearest frame');
+  QUnit.equal(
+    Math.floor(clock.audioTsToVideoTs(audioBMDT, sampleRate) -
+               clock.secondsToVideoTs(10 + videoGap)),
+    Math.floor(clock.secondsToVideoTs(expectedFillSeconds) % frameDuration -
+               clock.secondsToVideoTs(offsetSeconds)),
+               'filled all but frame remainder between video start and audio start');
+});
+
+QUnit.test('fills audio gaps with existing frame if odd sample rate', function() {
+  var
+    events = [],
+    boxes,
+    numSilentFrames,
+    videoGap = 0.29,
+    audioGap = 0.49,
+    expectedFillSeconds = audioGap - videoGap,
+    sampleRate = 90e3, // we don't have matching silent frames
+    frameDuration = Math.ceil(90e3 / (sampleRate / 1024)),
+    frameSeconds = clock.videoTsToSeconds(frameDuration),
+    audioBMDT,
+    offsetSeconds = clock.videoTsToSeconds(111),
+    startingAudioBMDT = clock.secondsToAudioTs(10 + audioGap - offsetSeconds, sampleRate);
+
+  audioSegmentStream.on('data', function(event) {
+    events.push(event);
+  });
+
+  audioSegmentStream.setAudioAppendStart(clock.secondsToVideoTs(10));
+  audioSegmentStream.setVideoBaseMediaDecodeTime(clock.secondsToVideoTs(10 + videoGap));
+
+  audioSegmentStream.push({
+    channelcount: 2,
+    samplerate: sampleRate,
+    pts: clock.secondsToVideoTs(10 + audioGap),
+    dts: clock.secondsToVideoTs(10 + audioGap),
+    data: new Uint8Array([1])
+  });
+
+  audioSegmentStream.flush();
+
+  numSilentFrames = Math.floor(expectedFillSeconds / frameSeconds);
+
+  QUnit.equal(events.length, 1, 'a data event fired');
+  QUnit.equal(events[0].track.samples.length, 1 + numSilentFrames, 'generated samples');
+  QUnit.equal(events[0].track.samples[0].size, 1, 'copied sample');
+  QUnit.equal(events[0].track.samples[7].size, 1, 'copied sample');
+  QUnit.equal(events[0].track.samples[8].size, 1, 'normal sample');
+  boxes = mp4.tools.inspect(events[0].boxes);
+
+  audioBMDT = boxes[0].boxes[1].boxes[1].baseMediaDecodeTime;
+
+  QUnit.equal(
+    audioBMDT,
+    // should always be rounded up so as not to overfill
+    Math.ceil(startingAudioBMDT -
+              clock.secondsToAudioTs(numSilentFrames * frameSeconds, sampleRate)),
+    'filled the gap to the nearest frame');
+  QUnit.equal(
+    Math.floor(clock.audioTsToVideoTs(audioBMDT, sampleRate) -
+               clock.secondsToVideoTs(10 + videoGap)),
+    Math.floor(clock.secondsToVideoTs(expectedFillSeconds) % frameDuration -
+               clock.secondsToVideoTs(offsetSeconds)),
+               'filled all but frame remainder between video start and audio start');
+});
+
+QUnit.test('fills audio gaps with smaller of audio gap and audio-video gap', function() {
+  var
+    events = [],
+    boxes,
+    offsetSeconds = clock.videoTsToSeconds(111),
+    videoGap = 0.29,
+    sampleRate = 44100,
+    frameDuration = Math.ceil(90e3 / (sampleRate / 1024)),
+    frameSeconds = clock.videoTsToSeconds(frameDuration),
+    // audio gap smaller, should be used as fill
+    numSilentFrames = 1,
+    // buffer for imprecise numbers
+    audioGap = frameSeconds + offsetSeconds + 0.001,
+    oldAudioEnd = 10.5,
+    audioBMDT;
+
+  audioSegmentStream.on('data', function(event) {
+    events.push(event);
+  });
+
+  audioSegmentStream.setAudioAppendStart(clock.secondsToVideoTs(oldAudioEnd));
+  audioSegmentStream.setVideoBaseMediaDecodeTime(clock.secondsToVideoTs(10 + videoGap));
+
+  audioSegmentStream.push({
+    channelcount: 2,
+    samplerate: sampleRate,
+    pts: clock.secondsToVideoTs(oldAudioEnd + audioGap),
+    dts: clock.secondsToVideoTs(oldAudioEnd + audioGap),
+    data: new Uint8Array([1])
+  });
+
+  audioSegmentStream.flush();
+
+  QUnit.equal(events.length, 1, 'a data event fired');
+  QUnit.equal(events[0].track.samples.length, 1 + numSilentFrames, 'generated samples');
+  QUnit.equal(events[0].track.samples[0].size, 364, 'silent sample');
+  QUnit.equal(events[0].track.samples[1].size, 1, 'normal sample');
+  boxes = mp4.tools.inspect(events[0].boxes);
+
+  audioBMDT = boxes[0].boxes[1].boxes[1].baseMediaDecodeTime;
+
+  QUnit.equal(
+    Math.floor(clock.secondsToVideoTs(oldAudioEnd + audioGap) -
+               clock.audioTsToVideoTs(audioBMDT, sampleRate) -
+               clock.secondsToVideoTs(offsetSeconds)),
+    Math.floor(frameDuration + 0.001),
+    'filled length of audio gap only');
+});
+
+QUnit.test('does not fill audio gaps if no audio append start time', function() {
+  var
+    events = [],
+    boxes,
+    videoGap = 0.29,
+    audioGap = 0.49;
+
+  audioSegmentStream.on('data', function(event) {
+    events.push(event);
+  });
+
+  audioSegmentStream.setVideoBaseMediaDecodeTime((10 + videoGap) * 90e3);
+
+  audioSegmentStream.push({
+    channelcount: 2,
+    samplerate: 90e3,
+    pts: (10 + audioGap) * 90e3,
+    dts: (10 + audioGap) * 90e3,
+    data: new Uint8Array([1])
+  });
+
+  audioSegmentStream.flush();
+
+  QUnit.equal(events.length, 1, 'a data event fired');
+  QUnit.equal(events[0].track.samples.length, 1, 'generated samples');
+  QUnit.equal(events[0].track.samples[0].size, 1, 'normal sample');
+  boxes = mp4.tools.inspect(events[0].boxes);
+  QUnit.equal(boxes[0].boxes[1].boxes[1].baseMediaDecodeTime,
+              (10 + audioGap) * 90e3 - 111,
+              'did not fill gap');
+});
+
+QUnit.test('does not fill audio gap if no video base media decode time', function() {
+  var
+    events = [],
+    boxes,
+    audioGap = 0.49;
+
+  audioSegmentStream.on('data', function(event) {
+    events.push(event);
+  });
+
+  audioSegmentStream.setAudioAppendStart(10 * 90e3);
+
+  audioSegmentStream.push({
+    channelcount: 2,
+    samplerate: 90e3,
+    pts: (10 + audioGap) * 90e3,
+    dts: (10 + audioGap) * 90e3,
+    data: new Uint8Array([1])
+  });
+
+  audioSegmentStream.flush();
+
+  QUnit.equal(events.length, 1, 'a data event fired');
+  QUnit.equal(events[0].track.samples.length, 1, 'generated samples');
+  QUnit.equal(events[0].track.samples[0].size, 1, 'normal sample');
+  boxes = mp4.tools.inspect(events[0].boxes);
+  QUnit.equal(boxes[0].boxes[1].boxes[1].baseMediaDecodeTime,
+              (10 + audioGap) * 90e3 - 111,
+              'did not fill the gap');
+});
+
+QUnit.test('does not fill audio gaps greater than a half second', function() {
+  var
+    events = [],
+    boxes,
+    videoGap = 0.01,
+    audioGap = videoGap + 0.51;
+
+  audioSegmentStream.on('data', function(event) {
+    events.push(event);
+  });
+
+  audioSegmentStream.setAudioAppendStart(10 * 90e3);
+  audioSegmentStream.setVideoBaseMediaDecodeTime((10 + videoGap) * 90e3);
+
+  audioSegmentStream.push({
+    channelcount: 2,
+    samplerate: 90e3,
+    pts: (10 + audioGap) * 90e3,
+    dts: (10 + audioGap) * 90e3,
+    data: new Uint8Array([1])
+  });
+
+  audioSegmentStream.flush();
+
+  QUnit.equal(events.length, 1, 'a data event fired');
+  QUnit.equal(events[0].track.samples.length, 1, 'generated samples');
+  QUnit.equal(events[0].track.samples[0].size, 1, 'normal sample');
+  boxes = mp4.tools.inspect(events[0].boxes);
+  QUnit.equal(boxes[0].boxes[1].boxes[1].baseMediaDecodeTime,
+              (10 + audioGap) * 90e3 - 111,
+              'did not fill gap');
+});
+
+QUnit.test('does not fill audio gaps smaller than a frame duration', function() {
+  var
+    events = [],
+    boxes,
+    offsetSeconds = clock.videoTsToSeconds(111),
+    // audio gap small enough that it shouldn't be filled
+    audioGap = 0.001,
+    newVideoStart = 10,
+    oldAudioEnd = 10.3,
+    newAudioStart = oldAudioEnd + audioGap + offsetSeconds;
+
+  audioSegmentStream.on('data', function(event) {
+    events.push(event);
+  });
+
+  // the real audio gap is tiny, but the gap between the new video and audio segments
+  // would be large enough to fill
+  audioSegmentStream.setAudioAppendStart(clock.secondsToVideoTs(oldAudioEnd));
+  audioSegmentStream.setVideoBaseMediaDecodeTime(clock.secondsToVideoTs(newVideoStart));
+
+  audioSegmentStream.push({
+    channelcount: 2,
+    samplerate: 90e3,
+    pts: clock.secondsToVideoTs(newAudioStart),
+    dts: clock.secondsToVideoTs(newAudioStart),
+    data: new Uint8Array([1])
+  });
+
+  audioSegmentStream.flush();
+
+  QUnit.equal(events.length, 1, 'a data event fired');
+  QUnit.equal(events[0].track.samples.length, 1, 'generated samples');
+  QUnit.equal(events[0].track.samples[0].size, 1, 'normal sample');
+  boxes = mp4.tools.inspect(events[0].boxes);
+  QUnit.equal(boxes[0].boxes[1].boxes[1].baseMediaDecodeTime,
+              clock.secondsToVideoTs(newAudioStart - offsetSeconds),
+              'did not fill gap');
+});
+
 QUnit.test('ensures baseMediaDecodeTime for audio is not negative', function() {
   var events = [], boxes;
 
@@ -3111,7 +3463,7 @@ QUnit.test('drops nalUnits at the start of a segment not preceeded by an access_
   QUnit.equal(segments[0].tags.videoTags.length, 1, 'generated a single video tag');
 });
 
-QUnit.test('generates an audio tags', function() {
+QUnit.test('generates audio tags', function() {
   var segments = [];
   transmuxer.on('data', function(segment) {
     segments.push(segment);

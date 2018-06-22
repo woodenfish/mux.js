@@ -1424,8 +1424,10 @@ QUnit.test('can be reset', function() {
 QUnit.module('VideoSegmentStream', {
   setup: function() {
     var track = {};
-    videoSegmentStream = new VideoSegmentStream(track);
+    var options = {};
+    videoSegmentStream = new VideoSegmentStream(track, options);
     videoSegmentStream.track = track;
+    videoSegmentStream.options = options;
     videoSegmentStream.track.timelineStartInfo = {
       dts: 10,
       pts: 10,
@@ -2072,6 +2074,45 @@ QUnit.test('calculates baseMediaDecodeTime values from the first DTS ever seen a
   boxes = mp4.tools.inspect(segment);
   tfdt = boxes[0].boxes[1].boxes[1];
   QUnit.equal(tfdt.baseMediaDecodeTime, 90, 'calculated baseMediaDecodeTime');
+});
+
+QUnit.test('doesn\'t adjust baseMediaDecodeTime when configured to keep original timestamps', function() {
+  videoSegmentStream.options.keepOriginalTimestamps = true;
+
+  var segment, boxes, tfdt;
+  videoSegmentStream.on('data', function(data) {
+    segment = data.boxes;
+  });
+
+  videoSegmentStream.push({
+    data: new Uint8Array([0x09, 0x01]),
+    nalUnitType: 'access_unit_delimiter_rbsp',
+    dts: 100,
+    pts: 100
+  });
+  videoSegmentStream.push({
+    data: new Uint8Array([0x09, 0x01]),
+    nalUnitType: 'slice_layer_without_partitioning_rbsp_idr',
+    dts: 100,
+    pts: 100
+  });
+  videoSegmentStream.push({
+    data: new Uint8Array([0x09, 0x01]),
+    nalUnitType: 'access_unit_delimiter_rbsp',
+    dts: 200,
+    pts: 200
+  });
+  videoSegmentStream.push({
+    data: new Uint8Array([0x09, 0x01]),
+    nalUnitType: 'access_unit_delimiter_rbsp',
+    dts: 300,
+    pts: 300
+  });
+  videoSegmentStream.flush();
+
+  boxes = mp4.tools.inspect(segment);
+  tfdt = boxes[0].boxes[1].boxes[1];
+  QUnit.equal(tfdt.baseMediaDecodeTime, 100, 'calculated baseMediaDecodeTime');
 });
 
 QUnit.test('calculates baseMediaDecodeTime values relative to a customizable baseMediaDecodeTime', function() {
@@ -3574,6 +3615,12 @@ validateTrackFragment = function(track, segment, metadata, type) {
       QUnit.equal(sample.flags.isDependedOn, 0, 'dependency of other samples is unknown');
       QUnit.equal(sample.flags.hasRedundancy, 0, 'sample redundancy is unknown');
       QUnit.equal(sample.flags.degradationPriority, 0, 'sample degradation priority is zero');
+      // If current sample is Key frame
+      if (sample.flags.dependsOn === 2) {
+        QUnit.equal(sample.flags.isNonSyncSample, 0, 'samples_is_non_sync_sample flag is zero');
+      } else {
+        QUnit.equal(sample.flags.isNonSyncSample, 1, 'samples_is_non_sync_sample flag is one');
+      }
     } else {
       QUnit.equal(sample.duration, 1024,
             'aac sample duration is always 1024');
